@@ -6,7 +6,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Output Python version
       id: python-version
       run: |
@@ -17,7 +17,7 @@ jobs:
         architecture: x64
     - name: Install and configure Poetry
       run: |
-        pip install poetry==1.1.*
+        pip install poetry==1.5.*
         poetry config virtualenvs.in-project true
     - name: Set up cache
       uses: actions/cache@v2.1.5
