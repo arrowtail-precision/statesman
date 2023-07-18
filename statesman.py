@@ -27,9 +27,17 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    Iterable,
 )
 
-import pydantic
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    ConfigDict,
+    model_validator,
+    field_validator,
+)
 
 __all__ = [
     "StateEnum",
@@ -95,7 +103,7 @@ class StateEnum(enum.Enum):
         return "__active__"
 
     @classproperty
-    def __initial__(cls) -> Optional["StateEnum"]:
+    def __initial__(cls) -> "StateEnum" | None:
         """Return the initial state member as annotated via the
         statesman.InitialState class."""
         return next(
@@ -109,7 +117,7 @@ class StateEnum(enum.Enum):
             )
 
 
-class Action(pydantic.BaseModel):
+class Action(BaseModel):
     """An Action is a callable object attached to states and events within a state machine."""
 
     class Types(str, enum.Enum):
@@ -129,7 +137,7 @@ class Action(pydantic.BaseModel):
     signature: inspect.Signature
     type: Optional["Action.Types"] = None
 
-    @pydantic.model_validator(mode="before")
+    @model_validator(mode="before")
     def _cache_signature(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         if callable := values.get("callable", None):
             values["signature"] = inspect.Signature.from_callable(callable)
@@ -147,16 +155,16 @@ class Action(pydantic.BaseModel):
         else:
             return self.callable(*matched_args, **matched_kwargs)
 
-    model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 Action.model_rebuild()
 
 
-class BaseModel(pydantic.BaseModel):
+class Base(BaseModel):
     """Provides common functionality for statesman models."""
 
-    _actions: List[Action] = pydantic.PrivateAttr([])
+    _actions: List[Action] = PrivateAttr([])
 
     def _add_action(self, action: Action) -> None:
         """Add an action."""
@@ -205,7 +213,7 @@ class BaseModel(pydantic.BaseModel):
             return results
 
 
-class State(BaseModel):
+class State(Base):
     """Models a state within a state machine.
 
     State objects can be tested for equality against `str` and `StateEnum` objects.
@@ -216,7 +224,7 @@ class State(BaseModel):
     """
 
     name: str
-    description: Optional[str] = None
+    description: str | None = None
 
     @classmethod
     def from_enum(cls, class_: Type[StateEnum]) -> List["State"]:
@@ -240,8 +248,8 @@ class State(BaseModel):
             name="__active__", description="The active state at transition time."
         )
 
-    @pydantic.field_validator("name", "description", mode="before")
-    def _value_from_base_states(cls, value: Union[str, StateEnum], field) -> str:
+    @field_validator("name", mode="before")
+    def _name_value_from_base_states(cls, value: str | StateEnum, field) -> str:
         """Extract the appropriate value for the model field from a States
         enumeration value.
 
@@ -250,14 +258,25 @@ class State(BaseModel):
         name and the value populates the description.
         """
         if isinstance(value, StateEnum):
-            if field.name == "name":
-                return value.name
-            elif field.name == "description":
-                return value.value
+            return value.name
 
         return value
 
-    def __init__(self, name: str, description: Optional[str] = None) -> None:
+    @field_validator("description", mode="before")
+    def _description_value_from_base_states(cls, value: str | StateEnum, field) -> str:
+        """Extract the appropriate value for the model field from a States
+        enumeration value.
+
+        States objects are serialized differently than typical Enum
+        values in Pydantic. The name field is used to populate the state
+        name and the value populates the description.
+        """
+        if isinstance(value, StateEnum):
+            return value.value
+
+        return value
+
+    def __init__(self, name: str, description: str | None = None) -> None:
         super().__init__(name=name, description=description)
 
     def __eq__(self, other) -> bool:
@@ -315,7 +334,7 @@ class State(BaseModel):
         return super()._remove_actions(actions)
 
 
-class Event(BaseModel):
+class Event(Base):
     """Event objects model something that happens within a state machine that triggers a state transition.
 
     Attributes:
@@ -328,11 +347,11 @@ class Event(BaseModel):
     """
 
     name: str
-    description: Optional[str] = None
-    sources: List[Union[None, State]]
+    description: str | None = None
+    sources: List[State | None]
     target: State
-    transition_type: Optional["Transition.Types"]
-    return_type: Type["Result"] = pydantic.Field(default=bool)
+    transition_type: Optional["Transition.Types"] = None
+    return_type: Result = Field(default=bool)
 
     @property
     def actions(self) -> List[Action]:
@@ -414,7 +433,7 @@ class Guard(str, enum.Enum):
     exception = "exception"
 
 
-class StateMachine(pydantic.BaseModel):
+class StateMachine(BaseModel):
     """StateMachine objects model state machines comprised of states, events,
     and associated actions.
 
@@ -433,16 +452,19 @@ class StateMachine(pydantic.BaseModel):
 
     __state__: Optional[StateEnum] = None
 
-    _state: Optional[State] = pydantic.PrivateAttr(None)
-    _states: List[State] = pydantic.PrivateAttr([])
-    _events: List[Event] = pydantic.PrivateAttr([])
+    _state: State | None = PrivateAttr(None)
+    _states: List[State] = PrivateAttr([])
+    _events: List[Event] = PrivateAttr([])
+
+    _state_entry: Entry = PrivateAttr(Entry.allow)
+    _guard_with: Guard = PrivateAttr(Guard.silence)
 
     def __init__(
         self,
         *,
         states: List[State] = [],
         events: List[Event] = [],
-        state: Optional[Union[State, str, StateEnum]] = None,
+        state: State | str | StateEnum | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -578,7 +600,7 @@ class StateMachine(pydantic.BaseModel):
         cls,
         states: List[State] = [],
         events: List[Event] = [],
-        state: Optional[Union[State, str, StateEnum]] = None,
+        state: State | str | StateEnum | None = None,
         *args,
         **kwargs,
     ) -> "StateMachine":
@@ -597,7 +619,7 @@ class StateMachine(pydantic.BaseModel):
         return state_machine
 
     @property
-    def state(self) -> Optional[State]:
+    def state(self) -> State | None:
         """Return the current state of the state machine."""
         return self._state
 
@@ -632,12 +654,12 @@ class StateMachine(pydantic.BaseModel):
         """Remove a sequence of states from the state machine."""
         [self.remove_state(state) for state in states]
 
-    def get_state(self, name: Union[str, StateEnum]) -> Optional[State]:
+    def get_state(self, name: str | StateEnum) -> State | None:
         """Retrieve a state object by name or enum value."""
         name_ = name.name if isinstance(name, StateEnum) else name
         return next(filter(lambda s: s.name == name_, self.states), None)
 
-    def get_states(self, *names: List[Union[str, StateEnum]]) -> List[State]:
+    def get_states(self, *names: List[str | StateEnum]) -> List[State]:
         """Retrieve a list of states in the state machine by name or enum
         value."""
         names_ = []
@@ -683,7 +705,7 @@ class StateMachine(pydantic.BaseModel):
         """Remove a sequence of events from the state machine."""
         [self.remove_event(event) for event in events]
 
-    def get_event(self, name: Union[str, StateEnum]) -> Optional[Event]:
+    def get_event(self, name: str | StateEnum) -> Event | None:
         """Return the event with the given name or None if the state cannot be
         found."""
         if isinstance(name, (str, StateEnum)):
@@ -697,9 +719,9 @@ class StateMachine(pydantic.BaseModel):
 
     def can_trigger_event(
         self,
-        event: Union[Event, str],
+        event: Event | str,
         *,
-        from_state: Optional[Union[str, StateEnum, State]] = None,
+        from_state: str | StateEnum | State | None = None,
     ) -> bool:
         """Return a boolean value that indicates if the event can be triggered from a state."""
         event_ = self.get_event(event) if isinstance(event, str) else event
@@ -707,7 +729,7 @@ class StateMachine(pydantic.BaseModel):
         return state_ in event_.sources
 
     def triggerable_events(
-        self, *, from_state: Optional[Union[str, StateEnum, State]] = None
+        self, *, from_state: str | StateEnum | State | None = None
     ) -> List[Event]:
         """Return a list of events triggerable from a state."""
         return list(
@@ -719,9 +741,9 @@ class StateMachine(pydantic.BaseModel):
 
     async def trigger_event(
         self,
-        event: Union[Event, str],
+        event: Event | str,
         *args,
-        return_type: Optional[Type[Result]] = None,
+        return_type: Result | None = None,
         **kwargs,
     ) -> Union[None, bool, "Transition", List[Any], Any]:
         """Trigger a state transition event.
@@ -791,10 +813,10 @@ class StateMachine(pydantic.BaseModel):
 
     async def enter_state(
         self,
-        state: Union[State, StateEnum, str],
+        state: State | StateEnum | str,
         *args,
-        type_: Optional[Transition.Types] = None,
-        return_type: Type[Result] = bool,
+        type_: Transition.Types | None = None,
+        return_type: Result = bool,
         **kwargs,
     ) -> Result:
         """Transition the state machine into a specific state.
@@ -813,7 +835,7 @@ class StateMachine(pydantic.BaseModel):
         to another in this manner can lead to inconsistent and surprising behavior because you may be forcing the state machine
         to change states in a way that is otherwise unreachable.
 
-        Usage of this method can be restricted through the nested `Config` class. The `state_entry` attribute provides
+        Usage of this method can be restricted through the nested `Config` class. The `_state_entry` attribute provides
         configuration of state entry behaviors via the `Entry` enum. There are four modes available:
             * `Entry.allow` - The `enter_state` method can be called at any time (the default).
             * `Entry.initial` - The `enter_state` method can be called to establish initial state and thereafter is forbidden.
@@ -835,22 +857,22 @@ class StateMachine(pydantic.BaseModel):
             LookupError: Raised if the state cannot be found by name or enum value.
             TypeError: Raised if the state value given is not a State, StateEnum, or str object.
         """
-        state_entry = self.__config__.state_entry
-        if state_entry == Entry.allow:
+        _state_entry = self._state_entry
+        if _state_entry == Entry.allow:
             pass
-        elif state_entry == Entry.initial:
+        elif _state_entry == Entry.initial:
             if self.state is not None:
                 raise RuntimeError(
                     "state entry failed: `enter_state` is only available to set initial state"
                 )
-        elif state_entry == Entry.ignore:
+        elif _state_entry == Entry.ignore:
             return False
-        elif state_entry == Entry.forbid:
+        elif _state_entry == Entry.forbid:
             raise RuntimeError(
                 "state entry failed: use of the `enter_state` method is forbidden"
             )
         else:
-            raise ValueError(f"unknown Entry value: {state_entry}")
+            raise ValueError(f"unknown Entry value: {_state_entry}")
 
         if isinstance(state, State):
             state_ = state
@@ -945,19 +967,15 @@ class StateMachine(pydantic.BaseModel):
             kwargs: A dict of supplemental keyword arguments passed when the transition was triggered.
         """
 
-    def __repr_args__(self) -> pydantic.ReprArgs:
+    def __repr_args__(self) -> ReprArgs:
         return [("states", self.states), ("events", self.events), ("state", self.state)]
-
-    model_config = pydantic.ConfigDict(
-        state_entry=Entry.allow, guard_with=Guard.silence
-    )
 
 
 # The types that transition results can be represented as.
 Result = TypeVar("Result", bool, object, tuple, list, "Transition")
 
 
-class Transition(pydantic.BaseModel):
+class Transition(BaseModel):
     """Transition objects model a state change within a state machine.
 
     The behavior of a transition is dependent upon the current state of the state machine, the source and target
@@ -1012,20 +1030,18 @@ class Transition(pydantic.BaseModel):
         self = "Self Transition"
 
     state_machine: StateMachine
-    source: Optional[State] = None
+    source: State | None = None
     target: State
-    event: Optional[Event] = None
+    event: Event | None = None
     type: Transition.Types
-    created_at: datetime.datetime = pydantic.Field(
-        default_factory=datetime.datetime.now
-    )
-    started_at: Optional[datetime.datetime] = None
-    finished_at: Optional[datetime.datetime] = None
-    succeeded: Optional[bool] = None
-    cancelled: Optional[bool] = None
-    args: Optional[List[Any]] = None
-    kwargs: Optional[Dict[str, Any]] = None
-    results: Optional[List[Any]] = None
+    created_at: datetime.datetime = Field(default_factory=datetime.datetime.now)
+    started_at: datetime.datetime | None = None
+    finished_at: datetime.datetime | None = None
+    succeeded: bool | None = None
+    cancelled: bool | None = None
+    args: List[Any] | None = None
+    kwargs: Dict[str, Any] | None = None
+    results: List[Any] | None = None
 
     def __init__(self, state_machine: StateMachine, *args, **kwargs) -> None:
         super().__init__(state_machine=state_machine, *args, **kwargs)
@@ -1043,7 +1059,7 @@ class Transition(pydantic.BaseModel):
             # Guards can cancel the transition via return value or failed assertion
             self.cancelled = False
             self.succeeded = False
-            guard_with = self.state_machine.__config__.guard_with
+            _guard_with = self.state_machine._guard_with
             try:
                 result = await _call_with_matching_parameters(
                     self.state_machine.guard_transition, self, *args, **kwargs
@@ -1059,18 +1075,18 @@ class Transition(pydantic.BaseModel):
             except AssertionError as error:
                 self.cancelled = True
 
-                if guard_with == Guard.silence:
+                if _guard_with == Guard.silence:
                     pass
-                elif guard_with == Guard.warning:
+                elif _guard_with == Guard.warning:
                     warnings.warn(
                         "transition guard failure: guard_transition returned False"
                     )
-                elif guard_with == Guard.exception:
+                elif _guard_with == Guard.exception:
                     raise RuntimeError(
                         "transition guard failure: guard_transition returned False"
                     ) from error
                 else:
-                    raise ValueError(f"unknown Guard value: {guard_with}")
+                    raise ValueError(f"unknown Guard value: {_guard_with}")
 
                 return False
             await _call_with_matching_parameters(
@@ -1099,18 +1115,18 @@ class Transition(pydantic.BaseModel):
             except AssertionError as error:
                 self.cancelled = True
 
-                if guard_with == Guard.silence:
+                if _guard_with == Guard.silence:
                     pass
-                elif guard_with == Guard.warning:
+                elif _guard_with == Guard.warning:
                     warnings.warn(
                         "transition guard failure: guard action returned False"
                     )
-                elif guard_with == Guard.exception:
+                elif _guard_with == Guard.exception:
                     raise RuntimeError(
                         "transition guard failure: guard action returned False"
                     ) from error
                 else:
-                    raise ValueError(f"unknown Guard value: {guard_with}")
+                    raise ValueError(f"unknown Guard value: {_guard_with}")
 
                 return False
             await self._run_actions(self.event, Action.Types.before)
@@ -1145,7 +1161,7 @@ class Transition(pydantic.BaseModel):
             self.succeeded = True
             return True
 
-    @pydantic.model_validator(mode="before")
+    @model_validator(mode="before")
     def _set_default_type_from_event(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         type_ = values.get("type", None)
         event = values.get("event", None)
@@ -1159,21 +1175,20 @@ class Transition(pydantic.BaseModel):
 
         return values
 
-    @pydantic.model_validator(mode="after")
-    def _validate_type(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        type_ = values["type"]
-        if type_ in (Transition.Types.internal, Transition.Types.self):
+    @model_validator(mode="after")
+    def _validate_type(cls, m: "Transition") -> "Transition":
+        if m.type in (Transition.Types.internal, Transition.Types.self):
             assert (
-                values["target"] == values["source"]
+                m.target == m.source
             ), "source and target states must be the same for internal or self transitions"
-        elif type_ == Transition.Types.external:
+        elif m.type == Transition.Types.external:
             assert (
-                values["target"] != values["source"]
+                m.target != m.source
             ), "source and target states cannot be the same for external transitions"
         else:
-            raise ValueError(f'unknown transition type: "{type_}"')
+            raise ValueError(f'unknown transition type: "{m.type}"')
 
-        return values
+        return m
 
     @property
     def is_executing(self) -> bool:
@@ -1186,11 +1201,11 @@ class Transition(pydantic.BaseModel):
         return self.started_at is not None and self.finished_at is not None
 
     @property
-    def runtime(self) -> Optional[datetime.timedelta]:
+    def runtime(self) -> datetime.timedelta | None:
         """Return a time delta value detailing how long the transition took to execute."""
         return self.finished_at - self.started_at if self.is_finished else None
 
-    def results_as(self, type_: Type[Result]) -> Result:
+    def results_as(self, type_: Result) -> Result:
         """Return a representation of the results in the specified type."""
         scalar = self.results[0] if self.succeeded and self.results else None
         if type_ is bool:
@@ -1218,11 +1233,11 @@ class Transition(pydantic.BaseModel):
 
     async def _run_actions(
         self,
-        model: Optional[BaseModel],
+        model: Base | None,
         type_: Action.Types,
         concurrently: bool = True,
         **kwargs,
-    ) -> Optional[List[Any]]:
+    ) -> List[Any] | None:
         """Run all the actions of a given type attached to a State or Event model.
 
         Returns:
@@ -1244,44 +1259,42 @@ class Transition(pydantic.BaseModel):
 Transition.model_rebuild()
 Event.model_rebuild()
 
-StateIdentifier = Union[StateEnum, str]
+StateIdentifier = StateEnum | str
 Source = Union[None, StateIdentifier, List[StateIdentifier], Type[StateEnum]]
-Target = Union[None, StateIdentifier, ActiveState]
+Target = None | StateIdentifier | ActiveState
 
 
-class EventDescriptor(pydantic.BaseModel):
+class EventDescriptor(BaseModel):
     """Describes an Event within a state machine."""
 
-    description: Optional[str] = None
-    transition_type: Optional[Transition.Types] = None
-    return_type: Type[Result] = pydantic.Field(default=list)
-    source: List[Union[None, StateIdentifier]]
+    description: str | None = None
+    transition_type: Transition.Types | None = None
+    return_type: Result = Field(default=list)
+    source: List[StateIdentifier | None]
     target: Target
     guard: List[Callable]
     before: List[Callable]
     on: List[Callable]
     after: List[Callable]
 
-    @pydantic.field_validator("source", mode="before")
+    @field_validator("source", mode="before")
     @classmethod
-    def _listify_sources(cls, value: Source) -> List[Union[None, StateIdentifier]]:
+    def _listify_sources(cls, value: Source) -> List[StateIdentifier | None]:
         identifiers = []
 
         if isinstance(value, list):
-            identifiers.extend(value)
+            for v in value:
+                if isinstance(v, StateEnum):
+                    v = v.name
+                identifiers.append(v)
         else:
+            if isinstance(value, StateEnum):
+                value = value.name
             identifiers.append(value)
 
         return identifiers
 
-    @pydantic.field_validator("source", each_item=True, mode="before")
-    def _map_enums(cls, v) -> Optional[str]:
-        if isinstance(v, StateEnum):
-            return v.name
-
-        return v
-
-    @pydantic.field_validator("guard", "before", "on", "after", mode="before")
+    @field_validator("guard", "before", "on", "after", mode="before")
     @classmethod
     def _listify_actions(
         cls, value: Union[None, Callable, List[Callable]]
@@ -1301,12 +1314,12 @@ class EventDescriptor(pydantic.BaseModel):
         return hash(self.name)
 
 
-class ActionDescriptor(pydantic.BaseModel):
+class ActionDescriptor(BaseModel):
     """Describes an action attached to a State or Event."""
 
-    model: Type[BaseModel]
+    model: Type[Base]
     name: str
-    description: Optional[str] = None
+    description: str | None = None
     type: Action.Types
     callable: Callable
 
@@ -1318,9 +1331,9 @@ def event(
     guard: Union[None, Callable, List[Callable]] = None,
     before: Union[None, Callable, List[Callable]] = None,
     after: Union[None, Callable, List[Callable]] = None,
-    transition_type: Optional[Transition.Types] = None,
-    return_type: Type[Result] = object,
-    description: Optional[str] = None,
+    transition_type: Transition.Types | None = None,
+    return_type: Result = object,
+    description: str | None = None,
     **kwargs,
 ) -> None:
     """Transform a method into a state machine event.
@@ -1371,7 +1384,7 @@ def event(
 
 def enter_state(
     name: Union[StateIdentifier, List[StateIdentifier]],
-    description: Optional[str] = None,
+    description: str | None = None,
 ) -> None:
     """Transform a method into an enter state action."""
     return _state_action(name, Action.Types.entry, description)
@@ -1379,7 +1392,7 @@ def enter_state(
 
 def exit_state(
     name: Union[StateIdentifier, List[StateIdentifier]],
-    description: Optional[str] = None,
+    description: str | None = None,
 ) -> None:
     """Transform a method into an exit state action."""
     return _state_action(name, Action.Types.exit, description)
@@ -1388,7 +1401,7 @@ def exit_state(
 def _state_action(
     name: Union[StateIdentifier, List[StateIdentifier]],
     type_: Action.Types,
-    description: Optional[str] = None,
+    description: str | None = None,
 ):
     def decorator(fn):
         names = name if isinstance(name, list) else [name]
@@ -1412,27 +1425,27 @@ def _state_action(
     return decorator
 
 
-def guard_event(name: str, description: Optional[str] = None) -> None:
+def guard_event(name: str, description: str | None = None) -> None:
     """Transform a method into a guard event action."""
     return _event_action(name, Action.Types.guard, description)
 
 
-def before_event(name: str, description: Optional[str] = None) -> None:
+def before_event(name: str, description: str | None = None) -> None:
     """Transform a method into a before event action."""
     return _event_action(name, Action.Types.before, description)
 
 
-def on_event(name: str, description: Optional[str] = None) -> None:
+def on_event(name: str, description: str | None = None) -> None:
     """Transform a method into an on event action."""
     return _event_action(name, Action.Types.on, description)
 
 
-def after_event(name: str, description: Optional[str] = None) -> None:
+def after_event(name: str, description: str | None = None) -> None:
     """Transform a method into an after event action."""
     return _event_action(name, Action.Types.after, description)
 
 
-def _event_action(name: str, type_: Action.Types, description: Optional[str] = None):
+def _event_action(name: str, type_: Action.Types, description: str | None = None):
     def decorator(fn):
         description_ = inspect.getdoc(fn) if description is None else description
         descriptor = ActionDescriptor(
@@ -1550,11 +1563,11 @@ async def _call_with_matching_parameters(callable: Callable, *args, **kwargs) ->
         return callable(*matched_args, **matched_kwargs)
 
 
-class HistoryMixin(pydantic.BaseModel):
+class HistoryMixin(BaseModel):
     """A mixin that records all transitions that occur within the state
     machine."""
 
-    __private_attributes__ = {"_transitions": pydantic.PrivateAttr([])}
+    __private_attributes__ = {"_transitions": PrivateAttr([])}
 
     async def after_transition(self, transition: Transition) -> None:
         """Append a completed transition to the history."""
@@ -1571,10 +1584,10 @@ class HistoryMixin(pydantic.BaseModel):
         self._transitions.clear()
 
 
-class SequencingMixin(pydantic.BaseModel):
+class SequencingMixin(BaseModel):
     """A mixin that provides state transition sequencing functionality."""
 
-    __private_attributes__ = {"_queue": pydantic.PrivateAttr(collections.deque())}
+    _queue: Iterable = PrivateAttr(collections.deque())
 
     def sequence(self, *coroutines: List[Coroutine[Any, Any, Transition]]) -> None:
         """Sequence a series of coroutines that trigger state transitions.
@@ -1598,7 +1611,7 @@ class SequencingMixin(pydantic.BaseModel):
 
             self._queue.append(coroutine)
 
-    async def next_transition(self) -> Optional[Transition]:
+    async def next_transition(self) -> Transition | None:
         """Advance to the next sequenced state and return the executed Transition or None if the queue is empty.
 
         The transition is executed by awaiting the coroutine.
@@ -1619,7 +1632,7 @@ class SequencingMixin(pydantic.BaseModel):
 
 
 def get_instance_methods(
-    obj, *, stop_at_parent: Optional[Type[Any]] = None
+    obj, *, stop_at_parent: Type[Any] | None = None
 ) -> Dict[str, Callable]:
     """Return a mapping of method names to method callables in method definition order.
 
@@ -1675,9 +1688,9 @@ def _state_entry(
     entry: Entry = Entry.allow,
 ) -> Iterator[StateMachine]:
     """Temporarily override the value of the `entry` setting on a StateMachine object."""
-    original = obj.__config__.state_entry
-    obj.__config__.state_entry = entry
+    original = obj._state_entry
+    obj._state_entry = entry
     try:
         yield obj
     finally:
-        obj.__config__.state_entry = original
+        obj._state_entry = original
